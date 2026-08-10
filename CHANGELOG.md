@@ -4,7 +4,107 @@ All notable changes to kage are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.12] - 2026-08-10
+
+### Added
+
+- `CONTRIBUTING.md` documents the development setup, test commands, and
+  expectations for focused pull requests.
+- A `robots.txt` reference explains the `kage` agent token, `Crawl-delay`, and
+  the advisory `--no-robots` override ([#8](https://github.com/tamnd/kage/issues/8)).
+
+### Changed
+
+- `--exclude` and `--scope-prefix` now match complete path prefixes and their
+  descendants rather than arbitrary substrings. If you relied on the old
+  `--exclude` behaviour, pass the full path prefix.
+- `--max-pages` is documented as a cap on how many page URLs are queued rather
+  than how many render. The budget is spent in `enqueuePage`, so a page that
+  fails to render, that `robots.txt` disallows, or that turns out not to be HTML
+  has already taken its slot by the time kage finds out, and a run can save
+  fewer pages than the number asked for.
+
+### Deprecated
+
+- `--traversal` remains accepted for existing scripts but is now marked
+  deprecated because it was never read; crawls are always breadth-first. The
+  flag is planned for removal in the next minor release.
+
+### Fixed
+
+- Packing a mirror with multiple HTML pages but no root `index.html` creates a
+  bounded, title-sorted landing page, while a single-page archive still opens
+  directly on its article and keeps that article's title metadata ([#62](https://github.com/tamnd/kage/issues/62)).
+- Non-UTF-8 `<meta charset>` and Content-Type charset declarations are
+  rewritten to `utf-8`, matching the encoding kage writes to disk ([#16](https://github.com/tamnd/kage/issues/16)).
+  Rewriting covers the whole document, but whether the page *declares* an
+  encoding is answered from `<head>` alone. A charset meta that Chrome left in
+  `<body>` was otherwise treated as the document's declaration, so nothing was
+  inserted into `<head>` and the only declaration sat past the 1024 bytes a
+  reader pre-scans, which is the mojibake #16 is about.
+  A legacy `content="charset=iso-8859-1"` with no media type is now rewritten
+  too, instead of being left to contradict the injected UTF-8 declaration.
+- Relative links on redirected pages resolve against the browser's final URL
+  and the document's first `<base href>`, while the page remains saved under
+  the URL that was originally discovered. Consumed `href` attributes are
+  removed from every `<base>` so they cannot re-root rewritten links when the
+  saved page opens, while `target` behavior is preserved.
+  A redirect that leaves the crawl scope no longer takes the page's links with
+  it. `urlx.SameSite` matches hostnames exactly, so a seed redirecting apex→www
+  (or www→apex) resolved every relative link onto a host the scope rejects:
+  the links stayed absolute, nothing was enqueued, and the crawl saved the seed
+  page and stopped. Assets are matched on the registrable domain and kept
+  downloading, so the run ended with a complete-looking single page and no
+  error. The resolution base now falls back to the document `<base href>`, and
+  then to the enqueued URL, whenever the redirect target is out of scope.
+  A redirect that genuinely leaves the site is unchanged: those references
+  resolve to the other host and stay absolute, so they are not localised.
+- `--resume` picks an interrupted crawl back up instead of doing nothing ([#36](https://github.com/tamnd/kage/issues/36)).
+  `state.json` persisted only the visited set, and the frontier was rebuilt purely by re-rendering pages and following their links, which resume exists to avoid.
+  So a resumed run found its seed already visited, `enqueuePage` turned it down, nothing was queued, and the run printed `pages 0` and exited successfully with most of the site still missing.
+  Only sites with a `sitemap.xml` appeared to work, because those URLs are seeded independently on every run.
+  The unfinished frontier is now saved alongside the visited set, with each page's depth so `--max-depth` keeps its meaning across a restart, and re-queued at startup.
+  A run now also reports what it is leaving behind: `resume: 412 pages still to do, rerun to continue`.
+- A page that failed is retried by the next run instead of being lost.
+  Failures were never recorded anywhere, so the only way to pick them up was `--refresh`, which re-renders the entire site.
+  This is the "memory of what failed" asked for in [#36](https://github.com/tamnd/kage/issues/36).
+  A page `robots.txt` disallows is not carried over, since a later run would only fetch `robots.txt` and skip it again.
+- `--max-pages` no longer discards the pages it held back.
+  They stay in the frontier, so `kage clone example.com -p 20` to inspect a site and then `kage clone example.com` to finish it now works as a workflow.
+- `--scroll` scrolls the element that actually scrolls, so lazy-loaded content appears on app-shell pages ([#61](https://github.com/tamnd/kage/issues/61)).
+  It called `window.scrollBy`, which moves nothing on a site whose body is fixed to the viewport height with the document inside an inner container, and that is how Feishu, Notion, Linear and most dashboards are built.
+  The loop also stopped as soon as the distance travelled reached `document.body.scrollHeight`, which on those pages is one viewport, so it gave up after a single step even where the window did scroll.
+  kage now picks the largest genuinely scrollable element on the page, reads `scrollTop` back after each step instead of assuming the step landed, and keeps going until the position and the height both stop changing, which is what infinite scroll needs.
+  The scroll is bounded by half the render timeout, at least five seconds, so a page that appends content forever cannot hold a worker indefinitely.
+- Saved pages keep their `<!DOCTYPE html>` instead of rendering in quirks mode ([#16](https://github.com/tamnd/kage/issues/16)).
+  kage serialises a rendered page as the outerHTML of `<html>`, and a doctype is a sibling of `<html>` rather than a child, so it was never in that string and every page kage has ever written came out without one.
+  A document with no doctype is quirks mode in every browser: the box model reverts to the pre-CSS2 IE one and `line-height`, table cell inheritance and `vertical-align` all change, so the saved copy laid out differently from the original, and the `<meta charset>` declaration lost its authority, leaving a reader free to fall back to its locale encoding and mojibake every multibyte character.
+  That is the encoding problem reported in #16, and a webview or e-reader with no encoding menu has no way back from it.
+  The doctype is now read from the DOM and reproduced exactly rather than replaced with `<!DOCTYPE html>`, because the string itself selects the rendering mode: HTML 4.01 Transitional is standards mode with its system identifier and quirks mode without it.
+  A page that genuinely had no doctype on the live web still gets none, so it keeps rendering the way its author saw it.
+- The `cloned by kage` banner comment is written after the doctype rather than before it, so the doctype stays the first thing in the file.
+- Render pages open in the background, so a headful crawl no longer pulls the Chrome window in front of whatever you are working in ([#70](https://github.com/tamnd/kage/pull/70)).
+  `stealth.Page` creates every tab in the foreground, which meant a crawl driven through `--control-url` against a logged-in browser stole focus once per page.
+  kage now creates the page with `Background: true` and injects the same stealth script with `EvalOnNewDocument`, so anti-detection behaviour is unchanged.
+
+## [0.3.11] - 2026-08-01
+
+### Fixed
+
+- `go install github.com/tamnd/kage/cmd/kage@latest` works again ([#72](https://github.com/tamnd/kage/issues/72)).
+  The v0.3.9 antivirus fix used a local `replace` directive to remove Rod's embedded leakless watchdog, but Go rejects versioned installation of any module whose dependencies are changed that way.
+  Windows now uses a small native Chrome launcher that never imports leakless, while other platforms retain Rod's launcher; this removes the `replace` directive without putting the antivirus-flagged helper back into `kage.exe`.
+
+### Security
+
+- Updated `golang.org/x/text` to v0.39.0 for [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970), an infinite loop on invalid input.
+  `kage clone` reached the affected normalization code through the progress renderer, so govulncheck reported it as callable rather than merely present.
+
+## [0.3.10] - 2026-07-11
+
+### Changed
+
+- Updated the Go toolchain requirement to 1.26.5.
 
 ## [0.3.9] - 2026-07-08
 
@@ -13,7 +113,7 @@ All notable changes to kage are recorded here. The format follows
 - The Windows build no longer embeds the leakless watchdog binary that Windows Defender flags as `Trojan:Win32/Kepavll!rfn`, which made a fresh `scoop install` fail with a virus warning on `leakless.exe` ([#68](https://github.com/tamnd/kage/issues/68)).
   go-rod's launcher imports [leakless](https://github.com/ysmood/leakless), which base64/gzip-embeds a prebuilt helper for every platform and links the Windows one into `kage.exe`.
   kage already launches Chrome with leakless disabled, so the helper never ran, only added the flagged bytes.
-  A `replace` directive now points the package at an API-compatible stub under `third_party/leakless` that carries no embedded binary, dropping about 1.28 MB from the Windows build.
+  This release initially used a `replace` directive pointing at an API-compatible stub under `third_party/leakless`; the follow-up fix for [#72](https://github.com/tamnd/kage/issues/72) moved Windows to a launcher that does not import leakless, because Go rejects versioned installs of modules containing `replace`.
 
 ## [0.3.6] - 2026-06-19
 

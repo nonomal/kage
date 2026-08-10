@@ -19,6 +19,7 @@ import (
 	"github.com/tamnd/kage/sanitize"
 	"github.com/tamnd/kage/urlx"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 	"golang.org/x/time/rate"
 )
 
@@ -132,7 +133,7 @@ func (c *Cloner) Run(ctx context.Context) (Result, error) {
 		if err := c.front.load(c.statePth); err != nil {
 			c.logf("resume: could not load state: %v", err)
 		} else if n := c.front.visitedCount(); n > 0 {
-			c.logf("resume: %d pages already done", n)
+			c.logf("resume: %s already done", pagesPlural(n))
 		}
 	}
 
@@ -169,8 +170,15 @@ func (c *Cloner) Run(ctx context.Context) (Result, error) {
 		})
 	}
 
-	// Seed.
+	// Seed. A resumed run also re-queues the frontier the previous run saved on
+	// the way out. Without it the seed is already visited, enqueuePage turns it
+	// down, and since the frontier is otherwise rebuilt only by re-rendering
+	// pages and following their links, the run ends having done nothing at all
+	// (issue #36).
 	c.enqueuePage(ctx, c.seed, 0)
+	if n := c.requeueUnfinished(ctx); n > 0 {
+		c.logf("resume: picking up %s", pagesPlural(n))
+	}
 	if c.cfg.FollowSitemap {
 		c.seedSitemaps(ctx)
 	}
@@ -186,6 +194,11 @@ func (c *Cloner) Run(ctx context.Context) (Result, error) {
 	if c.cfg.Persist {
 		if err := c.front.save(c.statePth); err != nil {
 			c.logf("could not save resume state: %v", err)
+		} else if n := c.front.pendingCount(); n > 0 {
+			// Pages left in the frontier: interrupted, over the page budget, or
+			// failed. Saying so is the "memory of what failed" asked for in issue
+			// #36, and it stops a short run looking like a finished one.
+			c.logf("resume: %s still to do, rerun to continue", pagesPlural(n))
 		}
 	}
 
@@ -268,6 +281,7 @@ func (c *Cloner) processPage(ctx context.Context, j pageItem) {
 	key := c.pageKey(j.u)
 	if c.cfg.RespectRobots && !c.robots.Allowed(j.u.Path) {
 		c.stats.skipped.Add(1)
+		c.front.markDone(key)
 		return
 	}
 	if !c.waitForCrawlDelay(ctx) {
@@ -302,6 +316,13 @@ func (c *Cloner) processPage(ctx context.Context, j pageItem) {
 		return
 	}
 
+	// Resolve references against the post-redirect URL (and any <base href>),
+	// but keep writing the page under the discovered URL so existing offline
+	// links that pointed at /old still resolve. Cross-host redirects leave the
+	// resolve base as the final location for relative refs; scope checks still
+	// use that absolute URL.
+	resolveBase := scopedResolveBase(c.seed, j.u, res.FinalURL, root, c.cfg.scope())
+
 	localFile := urlx.LocalPath(c.seedHost, j.u, urlx.Page, c.cfg.Reserved)
 	fileDir := urlx.Dir(localFile)
 
@@ -324,7 +345,7 @@ func (c *Cloner) processPage(ctx context.Context, j pageItem) {
 		}
 	}
 
-	asset.RewriteHTML(root, j.u, sink)
+	asset.RewriteHTML(root, resolveBase, sink)
 	sanitize.CleanTree(root, sanitize.Options{
 		KeepNoscript:   c.cfg.KeepNoscript,
 		MobileReadable: c.cfg.MobileReadable,
@@ -352,6 +373,83 @@ func (c *Cloner) waitForCrawlDelay(ctx context.Context) bool {
 	}
 
 	return c.crawlLimiter.Wait(ctx) == nil
+}
+
+// pageResolveBase picks the URL against which relative references on a rendered
+// page should resolve. Preference order:
+//  1. A document <base href> (the live page's own base);
+//  2. The browser's final URL after redirects;
+//  3. The URL that was enqueued.
+//
+// The page is still written under the enqueued URL so offline links discovered
+// as /old keep working when the server redirected /old → /new.
+//
+// Callers should prefer scopedResolveBase, which keeps an off-scope redirect
+// from taking the page's links with it.
+func pageResolveBase(enqueued *url.URL, finalURL string, root *html.Node) *url.URL {
+	base := enqueued
+	if finalURL != "" {
+		if u, err := url.Parse(finalURL); err == nil && u.Scheme != "" && u.Host != "" {
+			// Drop fragment; keep query/path as the browser shows them.
+			u.Fragment = ""
+			base = u
+		}
+	}
+	if href := documentBaseHref(root); href != "" {
+		if u, err := urlx.Normalize(base, href); err == nil {
+			return u
+		}
+	}
+	return base
+}
+
+// scopedResolveBase is pageResolveBase constrained to the crawl scope.
+//
+// urlx.SameSite matches hostnames exactly, so a seed that redirects apex→www
+// (or www→apex) lands on a host the scope rejects. Resolving the page's links
+// against that host would put every one of them out of scope: they stay
+// absolute, nothing is enqueued, and the crawl saves the seed page and stops.
+// The failure is quiet because assets are matched with SameRegistrableDomain
+// and still download, so the run ends with a complete-looking single page.
+//
+// A redirect that genuinely leaves the site (example.com/go/x → partner.com)
+// keeps the old behaviour: those links are out of scope either way, and they
+// are re-fetched and re-redirected if reached on their own.
+func scopedResolveBase(seed, enqueued *url.URL, finalURL string, root *html.Node, scope urlx.ScopeConfig) *url.URL {
+	base := pageResolveBase(enqueued, finalURL, root)
+	if urlx.InScope(seed, base, scope) {
+		return base
+	}
+	// Drop the redirect target but keep any document <base href>, which is the
+	// page's own statement about where its links point.
+	if b := pageResolveBase(enqueued, "", root); urlx.InScope(seed, b, scope) {
+		return b
+	}
+	return enqueued
+}
+
+// documentBaseHref returns the first <base href> in document order, or "".
+func documentBaseHref(root *html.Node) string {
+	var found string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if found != "" || n == nil {
+			return
+		}
+		if n.Type == html.ElementNode && n.DataAtom == atom.Base {
+			for _, a := range n.Attr {
+				if strings.EqualFold(a.Key, "href") && strings.TrimSpace(a.Val) != "" {
+					found = strings.TrimSpace(a.Val)
+					return
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil && found == ""; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(root)
+	return found
 }
 
 // processAsset downloads one asset, rewriting CSS references on the way, and
@@ -436,6 +534,32 @@ func classifyError(err error) string {
 	return err.Error()
 }
 
+// pagesPlural renders a page count with the right noun, for log lines that are
+// as likely to say 1 as 1,400.
+func pagesPlural(n int) string {
+	if n == 1 {
+		return "1 page"
+	}
+	return fmt.Sprintf("%d pages", n)
+}
+
+// requeueUnfinished puts the previous run's outstanding frontier back in the
+// queue and reports how many pages it queued. It is a no-op on a fresh run.
+func (c *Cloner) requeueUnfinished(ctx context.Context) int {
+	n := 0
+	for _, p := range c.front.unfinished() {
+		u, err := url.Parse(p.URL)
+		if err != nil {
+			c.logf("resume: dropping unreadable state entry %q: %v", p.URL, err)
+			continue
+		}
+		if c.enqueuePage(ctx, u, p.Depth) {
+			n++
+		}
+	}
+	return n
+}
+
 // enqueuePage offers a page URL to the frontier, honouring the visited set, the
 // depth cap, and the page budget. It reports whether the page was newly queued.
 func (c *Cloner) enqueuePage(ctx context.Context, u *url.URL, depth int) bool {
@@ -446,7 +570,10 @@ func (c *Cloner) enqueuePage(ctx context.Context, u *url.URL, depth int) bool {
 	if c.front.isVisited(key) {
 		return false
 	}
-	if !c.front.offer(key) {
+	// Recording the page as unfinished happens here, before the budget check
+	// below, so a page that was discovered but never started is still in the
+	// frontier the next run picks up (issue #36).
+	if !c.front.offer(key, pendingPage{URL: u.String(), Depth: depth}) {
 		return false
 	}
 	c.mu.Lock()

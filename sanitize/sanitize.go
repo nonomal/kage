@@ -49,7 +49,9 @@ type Report struct {
 	MetaRefreshRemoved  int
 	DeadLinksRemoved    int
 	CondCommentsRemoved int
+	BaseHrefsRemoved    int
 	CharsetAdded        bool
+	CharsetRewritten    bool
 }
 
 // jsURLAttrs are attributes whose value may be a javascript: URL.
@@ -79,7 +81,7 @@ func Strip(doc []byte, opts Options) ([]byte, Report, error) {
 func CleanTree(root *html.Node, opts Options) Report {
 	var rep Report
 	clean(root, opts, &rep)
-	rep.CharsetAdded = ensureCharset(root)
+	rep.CharsetAdded, rep.CharsetRewritten = ensureCharset(root)
 	if opts.MobileReadable {
 		ensureViewport(root)
 		injectMobileCSS(root)
@@ -109,6 +111,15 @@ func clean(n *html.Node, opts Options, rep *Report) {
 		}
 		if c.Type == html.ElementNode {
 			switch c.DataAtom {
+			case atom.Base:
+				// Link rewriting has already consumed the document base. Remove every
+				// href so a later base cannot become active when an earlier one is
+				// removed, but preserve target because it controls browsing contexts.
+				rep.BaseHrefsRemoved += stripBaseHrefs(c)
+				if len(c.Attr) == 0 {
+					n.RemoveChild(c)
+					continue
+				}
 			case atom.Script:
 				n.RemoveChild(c)
 				rep.ScriptsRemoved++
@@ -140,6 +151,20 @@ func clean(n *html.Node, opts Options, rep *Report) {
 		}
 		clean(c, opts, rep)
 	}
+}
+
+func stripBaseHrefs(n *html.Node) int {
+	kept := n.Attr[:0]
+	removed := 0
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, "href") {
+			removed++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	n.Attr = kept
+	return removed
 }
 
 // stripHandlers removes every on* event-handler attribute from n.
@@ -241,22 +266,26 @@ func unwrapNoscript(parent, ns *html.Node) {
 	parent.RemoveChild(ns)
 }
 
-// ensureCharset guarantees the document declares UTF-8, inserting a
-// <meta charset="utf-8"> at the top of <head> when none is present, and reports
-// whether it added one. kage renders every saved page as UTF-8, but a source
-// that set its charset only in the HTTP Content-Type header, with no <meta>
-// charset in the markup, loses that signal once the page is a standalone file.
-// A reader then serving the bytes without a charset falls back to its locale
-// encoding and mojibakes every multibyte character (curly quotes, dashes, a
-// non-breaking space). Declaring the charset in the markup makes the page
-// self-describing in any reader, kage's own viewer and Kiwix alike.
-func ensureCharset(root *html.Node) bool {
+// ensureCharset guarantees the document declares UTF-8. kage serialises every
+// saved page as UTF-8, so a stale source declaration must be rewritten or it
+// can make a standalone reader mojibake the output (issue #16). Missing
+// declarations are inserted at the start of <head>. The return values report
+// insertion and rewriting separately so the exported Report keeps the existing
+// meaning of CharsetAdded.
+func ensureCharset(root *html.Node) (added, rewritten bool) {
 	head := findElement(root, atom.Head)
 	if head == nil {
-		return false
+		return false, false
 	}
-	if hasCharsetMeta(head) {
-		return false
+	// Rewriting stale values is a whole-document job: a declaration Chrome moved
+	// into <body> still contradicts the UTF-8 bytes kage writes.
+	fix := fixCharsetMetas(root)
+	// Whether the document *declares* an encoding is a <head> question, though.
+	// Readers pre-scan only the first 1024 bytes, so a meta stranded in <body>
+	// is never found; treating it as a declaration left the saved page with
+	// nothing a reader could act on, which is the mojibake of issue #16.
+	if headDeclaresCharset(head) {
+		return false, fix.rewritten
 	}
 	meta := &html.Node{
 		Type:     html.ElementNode,
@@ -267,26 +296,95 @@ func ensureCharset(root *html.Node) bool {
 	// The declaration must precede any content for a reader to honour it, so it
 	// goes first in <head>.
 	head.InsertBefore(meta, head.FirstChild)
-	return true
+	return true, fix.rewritten
 }
 
-// hasCharsetMeta reports whether head already declares a character encoding,
-// either as <meta charset="..."> or the older <meta http-equiv="Content-Type"
-// content="...; charset=...">.
-func hasCharsetMeta(head *html.Node) bool {
-	for c := head.FirstChild; c != nil; c = c.NextSibling {
-		if c.Type != html.ElementNode || c.DataAtom != atom.Meta {
-			continue
-		}
-		if attr(c, "charset") != "" {
-			return true
-		}
-		if strings.EqualFold(attr(c, "http-equiv"), "content-type") &&
-			strings.Contains(strings.ToLower(attr(c, "content")), "charset=") {
-			return true
+type charsetMetaFix struct {
+	declared  bool
+	rewritten bool
+}
+
+// fixCharsetMetas finds charset declarations anywhere in the parsed document
+// and rewrites non-UTF-8 values. Searching the whole tree also handles malformed
+// input whose meta node Chrome serialised outside <head> without adding a
+// second, contradictory declaration. Declarations inside template content are
+// rewritten but do not count as declarations for the containing document.
+func fixCharsetMetas(n *html.Node) charsetMetaFix {
+	var fix charsetMetaFix
+	if n.Type == html.ElementNode && n.DataAtom == atom.Meta {
+		if charset := strings.TrimSpace(attr(n, "charset")); charset != "" {
+			fix.declared = true
+			if !strings.EqualFold(charset, "utf-8") {
+				setAttr(n, "charset", "utf-8")
+				fix.rewritten = true
+			}
+		} else if strings.EqualFold(attr(n, "http-equiv"), "content-type") {
+			content, contentFix := rewriteContentTypeCharset(attr(n, "content"))
+			fix = contentFix
+			if contentFix.rewritten {
+				setAttr(n, "content", content)
+			}
 		}
 	}
-	return false
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		childFix := fixCharsetMetas(c)
+		fix.rewritten = fix.rewritten || childFix.rewritten
+		if n.Type != html.ElementNode || n.DataAtom != atom.Template {
+			fix.declared = fix.declared || childFix.declared
+		}
+	}
+	return fix
+}
+
+// rewriteContentTypeCharset rewrites a charset parameter while preserving the
+// media type and other parameters. It accepts optional whitespace around '='.
+// headDeclaresCharset reports whether <head> itself carries an encoding
+// declaration, in either the <meta charset> or the legacy Content-Type form.
+// Content inside <template> is inert and does not count.
+func headDeclaresCharset(head *html.Node) bool {
+	var walk func(*html.Node) bool
+	walk = func(n *html.Node) bool {
+		if n.Type == html.ElementNode && n.DataAtom == atom.Meta {
+			if strings.TrimSpace(attr(n, "charset")) != "" {
+				return true
+			}
+			if strings.EqualFold(attr(n, "http-equiv"), "content-type") &&
+				strings.Contains(strings.ToLower(attr(n, "content")), "charset=") {
+				return true
+			}
+		}
+		if n.Type == html.ElementNode && n.DataAtom == atom.Template {
+			return false
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if walk(c) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(head)
+}
+
+func rewriteContentTypeCharset(content string) (string, charsetMetaFix) {
+	var fix charsetMetaFix
+	parts := strings.Split(content, ";")
+	// From 0, not 1: malformed markup writes content="charset=iso-8859-1" with
+	// no media type, and skipping the first field left that declaration in the
+	// saved page contradicting the UTF-8 bytes. A real media type has no "=",
+	// so the Cut below rejects it on its own.
+	for i := range parts {
+		key, value, ok := strings.Cut(parts[i], "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "charset") {
+			continue
+		}
+		fix.declared = true
+		if !strings.EqualFold(strings.Trim(strings.TrimSpace(value), `"'`), "utf-8") {
+			parts[i] = " charset=utf-8"
+			fix.rewritten = true
+		}
+	}
+	return strings.Join(parts, ";"), fix
 }
 
 // findElement returns the first element node of the given atom in document
@@ -380,11 +478,19 @@ func injectMobileCSS(root *html.Node) {
 	head.AppendChild(style)
 }
 
-// insertBanner prepends an HTML comment to the document.
+// insertBanner prepends an HTML comment to the document, after the doctype so
+// the doctype stays the first thing in the file. A comment ahead of it is legal
+// and modern browsers still read the doctype that follows, but older ones and
+// several offline readers take anything before it as a reason to drop into
+// quirks mode, which is the whole thing the doctype is there to prevent.
 func insertBanner(root *html.Node, text string) {
 	c := &html.Node{Type: html.CommentNode, Data: " " + text + " "}
-	if root.FirstChild != nil {
-		root.InsertBefore(c, root.FirstChild)
+	at := root.FirstChild
+	if at != nil && at.Type == html.DoctypeNode {
+		at = at.NextSibling
+	}
+	if at != nil {
+		root.InsertBefore(c, at)
 	} else {
 		root.AppendChild(c)
 	}
@@ -398,4 +504,14 @@ func attr(n *html.Node, key string) string {
 		}
 	}
 	return ""
+}
+
+func setAttr(n *html.Node, key, value string) {
+	for i := range n.Attr {
+		if strings.EqualFold(n.Attr[i].Key, key) {
+			n.Attr[i].Val = value
+			return
+		}
+	}
+	n.Attr = append(n.Attr, html.Attribute{Key: key, Val: value})
 }

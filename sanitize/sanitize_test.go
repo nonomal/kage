@@ -167,6 +167,43 @@ func TestKeepMetaRefreshPlain(t *testing.T) {
 	}
 }
 
+func TestBaseHrefRemovedAfterRewrite(t *testing.T) {
+	cases := []struct {
+		name        string
+		bases       string
+		wantBase    bool
+		wantTarget  bool
+		wantRemoved int
+	}{
+		{name: "href only", bases: `<base href="https://example.com/live/">`, wantRemoved: 1},
+		{name: "target only", bases: `<base target="_blank">`, wantBase: true, wantTarget: true},
+		{name: "href and target", bases: `<base href="https://example.com/live/" target="_blank">`, wantBase: true, wantTarget: true, wantRemoved: 1},
+		{name: "all hrefs", bases: `<base href="https://example.com/one/"><base href="https://example.com/two/" target="_blank">`, wantBase: true, wantTarget: true, wantRemoved: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := `<html><head>` + tc.bases + `</head><body><a href="saved.html">saved</a></body></html>`
+			out, rep, err := Strip([]byte(in), Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := strings.ToLower(string(out))
+			if got := strings.Contains(s, "<base"); got != tc.wantBase {
+				t.Errorf("base presence = %v, want %v:\n%s", got, tc.wantBase, out)
+			}
+			if got := strings.Contains(s, `target="_blank"`); got != tc.wantTarget {
+				t.Errorf("base target presence = %v, want %v:\n%s", got, tc.wantTarget, out)
+			}
+			if strings.Contains(s, "example.com/") {
+				t.Errorf("base href survived:\n%s", out)
+			}
+			if rep.BaseHrefsRemoved != tc.wantRemoved {
+				t.Errorf("BaseHrefsRemoved = %d, want %d", rep.BaseHrefsRemoved, tc.wantRemoved)
+			}
+		})
+	}
+}
+
 func TestCharsetAddedWhenMissing(t *testing.T) {
 	// A page whose source declared its charset only in the HTTP header has no
 	// <meta charset>. The saved file must gain one so a reader does not fall back
@@ -179,6 +216,9 @@ func TestCharsetAddedWhenMissing(t *testing.T) {
 	}
 	if !rep.CharsetAdded {
 		t.Error("CharsetAdded = false, want true")
+	}
+	if rep.CharsetRewritten {
+		t.Error("CharsetRewritten = true for a missing declaration")
 	}
 	s := string(out)
 	if !strings.Contains(strings.ToLower(s), `<meta charset="utf-8"/>`) {
@@ -266,10 +306,26 @@ func TestMobileReadableSkipsExistingViewport(t *testing.T) {
 }
 
 func TestCharsetNotDuplicated(t *testing.T) {
-	// A page that already declares a charset, in either form, is left alone.
+	in := `<html><head><meta charset="utf-8"><title>x</title></head><body></body></html>`
+	out, rep, err := Strip([]byte(in), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.CharsetAdded || rep.CharsetRewritten {
+		t.Errorf("unchanged UTF-8 declaration reported a change: %+v", rep)
+	}
+	if n := strings.Count(strings.ToLower(string(out)), "charset"); n != 1 {
+		t.Errorf("charset count = %d, want 1:\n%s", n, out)
+	}
+}
+
+func TestCharsetRewritesNonUTF8(t *testing.T) {
 	cases := []string{
-		`<html><head><meta charset="utf-8"><title>x</title></head><body></body></html>`,
-		`<html><head><meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1"><title>x</title></head><body></body></html>`,
+		`<html><head><meta charset="ISO-8859-1"><title>x</title></head><body></body></html>`,
+		`<html><head><meta http-equiv="Content-Type" content="text/html; charset = windows-1252; foo=bar"><title>x</title></head><body></body></html>`,
+		// A Content-Type with no media type at all, which is malformed but
+		// appears in the wild.
+		`<html><head><meta http-equiv="Content-Type" content="charset=iso-8859-1"><title>x</title></head><body></body></html>`,
 	}
 	for _, in := range cases {
 		out, rep, err := Strip([]byte(in), Options{})
@@ -277,10 +333,116 @@ func TestCharsetNotDuplicated(t *testing.T) {
 			t.Fatal(err)
 		}
 		if rep.CharsetAdded {
-			t.Errorf("CharsetAdded = true for a page that already declares one:\n%s", in)
+			t.Errorf("CharsetAdded = true for an existing declaration:\n%s", in)
 		}
-		if n := strings.Count(strings.ToLower(string(out)), "charset"); n != 1 {
+		if !rep.CharsetRewritten {
+			t.Errorf("CharsetRewritten = false for:\n%s", in)
+		}
+		s := strings.ToLower(string(out))
+		for _, stale := range []string{"iso-8859-1", "windows-1252", "shift_jis"} {
+			if strings.Contains(s, stale) {
+				t.Errorf("stale charset %q survived:\n%s", stale, out)
+			}
+		}
+		if n := strings.Count(s, "charset"); n != 1 {
 			t.Errorf("charset count = %d, want 1:\n%s", n, out)
 		}
+	}
+}
+
+// A charset meta that ended up in <body> is rewritten, but it does not answer
+// the question <head> has to answer: readers pre-scan only the first 1024 bytes,
+// so a declaration stranded further down is never seen (issue #16).
+func TestCharsetInBodyStillDeclaresInHead(t *testing.T) {
+	in := `<html><head><title>x</title></head><body><meta charset="shift_jis"><p>` +
+		strings.Repeat("padding ", 400) + `</p></body></html>`
+	out, rep, err := Strip([]byte(in), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.CharsetAdded {
+		t.Errorf("CharsetAdded = false, so <head> declares nothing: %+v", rep)
+	}
+	if !rep.CharsetRewritten {
+		t.Errorf("CharsetRewritten = false, so the body declaration is still stale: %+v", rep)
+	}
+	s := strings.ToLower(string(out))
+	if strings.Contains(s, "shift_jis") {
+		t.Errorf("stale charset survived:\n%s", out)
+	}
+	if n := strings.Count(s, "charset"); n != 2 {
+		t.Errorf("charset count = %d, want 2 (head declaration plus the rewritten body one):\n%s", n, out)
+	}
+	// The declaration has to land inside the window a reader actually scans.
+	if i := strings.Index(s, "charset"); i < 0 || i >= 1024 {
+		t.Errorf("first charset at byte %d, outside the 1024-byte prescan window:\n%s", i, out)
+	}
+}
+
+func TestCharsetInTemplateDoesNotDeclareDocumentEncoding(t *testing.T) {
+	in := `<html><head><template><meta charset="shift_jis"></template><title>x</title></head><body></body></html>`
+	out, rep, err := Strip([]byte(in), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.CharsetAdded || !rep.CharsetRewritten {
+		t.Errorf("template declaration should be rewritten without satisfying the document: %+v", rep)
+	}
+	s := strings.ToLower(string(out))
+	if strings.Contains(s, "shift_jis") {
+		t.Errorf("stale template charset survived:\n%s", out)
+	}
+	if n := strings.Count(s, `charset="utf-8"`); n != 2 {
+		t.Errorf("UTF-8 charset count = %d, want document and template declarations:\n%s", n, out)
+	}
+	if head, meta, template := strings.Index(s, "<head>"), strings.Index(s, "<meta charset"), strings.Index(s, "<template>"); head >= meta || meta >= template {
+		t.Errorf("document charset must be inserted before template content (head=%d meta=%d template=%d)", head, meta, template)
+	}
+}
+
+func TestDoctypePreservedAndBannerFollowsIt(t *testing.T) {
+	// The browser hands the doctype back with the page, and everything sanitize
+	// does has to leave it at the top of the file. A doctype anywhere but first
+	// is what puts a saved page into quirks mode (issue #16).
+	cases := []struct {
+		name, in, want string
+	}{
+		{"html5", `<!doctype html><html><head></head><body><p>x</p></body></html>`, "<!DOCTYPE html>"},
+		{
+			"html401 transitional",
+			`<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">` +
+				`<html><head></head><body><p>x</p></body></html>`,
+			`<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">`,
+		},
+	}
+	for _, c := range cases {
+		out, _, err := Strip([]byte(c.in), Options{Banner: "cloned by kage"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(out)
+		if !strings.HasPrefix(s, c.want) {
+			t.Errorf("%s: output should start with %s, got:\n%s", c.name, c.want, s)
+		}
+		if !strings.Contains(s, "<!-- cloned by kage -->") {
+			t.Errorf("%s: banner missing:\n%s", c.name, s)
+		}
+		if bannerIdx, dtIdx := strings.Index(s, "<!--"), strings.Index(s, "<!DOCTYPE"); bannerIdx < dtIdx {
+			t.Errorf("%s: banner must follow the doctype (banner=%d doctype=%d):\n%s", c.name, bannerIdx, dtIdx, s)
+		}
+	}
+}
+
+func TestNoDoctypeInvented(t *testing.T) {
+	// A page that carried no doctype was quirks mode on the live web. Adding one
+	// would switch it to standards mode and change its layout, so sanitize leaves
+	// that decision to the source.
+	in := `<html><head></head><body><p>x</p></body></html>`
+	out, _, err := Strip([]byte(in), Options{Banner: "cloned by kage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(out); strings.Contains(strings.ToUpper(s), "<!DOCTYPE") {
+		t.Errorf("sanitize invented a doctype:\n%s", s)
 	}
 }
